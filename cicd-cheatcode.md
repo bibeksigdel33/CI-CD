@@ -1,0 +1,210 @@
+# CI/CD cheatcode — my notes
+
+quick ref so I dont have to relearn this.. reading top to bottom = the full arc
+
+---
+
+## 1. branches
+- branches are flat in git's eyes.. its just a mental model for us, git doesnt really "see" a tree
+- the usual moves: create, push, pull, merge, switch
+- **ruleset / branch protection** → for main, staging etc I set rules so a PR is needed and ppl cant directly push to these branches
+
+## 2. pull request (PR)
+- the gate.. code cant get into a protected branch without going through a PR
+- this is where the robot's check will plug in (see below)
+
+---
+
+## 3. the robot = CI (continuous integration)
+- CI = the robot that runs tests automatically when stuff gets pushed / a PR opens
+- on github the robot is called **GitHub Actions**
+- 3 words to remember:
+  - **workflow** = the instruction sheet I write for the robot (a yml file)
+  - **trigger** = what wakes it up (eg a PR to main)
+  - **runner** = the fresh EMPTY machine github spins up.. does the work.. then throws it away
+
+### the workflow file
+lives at `.github/workflows/tests.yml`
+
+```yaml
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]      # trigger: wake up on PR to main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest      # the runner = fresh linux machine
+    steps:
+      - uses: actions/checkout@v5        # copy MY repo onto the empty machine
+      - uses: actions/setup-python@v5    # install python
+        with:
+          python-version: '3.12'
+      - run: pip install pytest          # machine is empty.. gotta install stuff
+      - run: pytest                      # run the tests
+```
+
+- `checkout` only copies my repo. it does NOT install my libraries. machine is a clean room, not furnished
+- green ✓ or red ✗ shows up right on the PR
+- in branch protection I can mark this check as **required** → PR cant merge until green. friday-5pm-disaster becomes impossible
+
+note: `on` keyword is secretly cursed (yaml reads it as `true`).. github handles it fine.. just an interview trivia thing
+
+---
+
+## 4. where do tests sit + how pytest finds them
+- test files just live in the repo WITH my code. nothing special. they ride along when checkout copies the repo
+
+```
+my-app/
+├── .github/workflows/tests.yml
+├── app/
+│   ├── __init__.py          # empty file = marks folder as importable package
+│   └── calculator.py
+└── tests/
+    └── test_calculator.py
+```
+
+- **pytest finds tests by NAMING convention, not by pairing files**
+  - it does NOT look at calculator.py and hunt for test_calculator.py
+  - it scans for files starting with `test_`, then runs functions starting with `test_`
+- the ONLY thing linking a test to my real code is the `import` line I write
+  - so: one test file can test many source files.. and one source file can be tested across many test files
+- `from app.calculator import add` → dots map to folders/files: `app` folder → `calculator.py` file → `add` function. (.py is implied)
+
+---
+
+## 5. unit test + the pyramid
+- what I wrote (test one function in isolation) = **unit test**. small, fast, focused
+- the map:
+  - **unit** (lots of them, fast, cheap) — one function in isolation
+  - **integration** (fewer) — does my code play nice with something else eg the database
+  - **end-to-end / e2e** (very few, slow) — whole app from user's POV, click button → see result
+- CI doesnt care which kind.. it just runs the command. pyramid = how I write tests, robot = when they run. two separate ideas
+
+---
+
+## 6. dependencies (the empty machine problem)
+- fresh runner = empty. has python but NOT my libraries or even pytest
+- if my project has NO outside libs (eg pure calculator) → just `pip install pytest`. dont make a file I dont need
+- if my project DOES import outside stuff (requests, pandas, flask..) → need **requirements.txt** = plain shopping list, one package per line
+
+```
+requests
+pandas
+pytest
+```
+
+- install it in the workflow: `- run: pip install -r requirements.txt`
+- `-r` = "read the package list from this file". no file = hard error
+- file must be COMMITTED + PUSHED (runner cant see my laptop)
+- can generate with `pip freeze > requirements.txt` BUT that dumps everything installed.. cleaner to hand-write when starting (virtual envs fix this, learn later)
+
+---
+
+## 7. the error I will 100% hit again
+**`ModuleNotFoundError: No module named 'app'`** in CI (works on my machine, red in CI)
+
+- reading the red:
+  - `ERROR collecting` (not FAILED) = it broke at IMPORT time, before any test ran
+  - `FAILED` = a test actually ran and an assertion was wrong (the "good" red)
+  - the real cause = always the BOTTOM of the traceback
+- why it happens: pytest puts the `tests/` folder on the path, NOT the repo root.. so `app/` is invisible
+- **fix (the good one):** make a `pytest.ini` at repo root:
+
+```ini
+[pytest]
+pythonpath = .
+```
+`.` = add repo root to path. now `app` is importable everywhere, locally AND in CI. kills the "works on my machine" gap
+
+- quick alt fix: run `python -m pytest` instead of bare `pytest` (adds current dir to path)
+
+---
+
+## 8. action versions = dependencies too
+- `actions/checkout@v5` → the `@v5` is a version PIN
+- github deprecates old node engines.. warning says bump the version
+- fix = just change the number (v4 → v5). bump ALL my actions, each versions independently
+- `@v5` = "v5 + minor patches, no breaking changes" = the sane default. strict shops pin exact commit hash
+- "CI throwing deprecation warnings" = routine maintenance, every real project
+
+---
+
+## 9. CD (continuous delivery / deployment)
+- CD = automatically SHIPPING the tested code somewhere
+- pointing Render at main so it redeploys on push = real CD, but **UNGATED** (render deploys even if tests failed.. bad)
+- vocab interviewers love:
+  - **continuous deployment** = green tests → ships to prod FULLY automatic, no human
+  - **continuous delivery** = green tests → ready to ship, but a HUMAN clicks approve for prod
+  - most companies use delivery for prod (nobody wants a 2am commit auto-hitting customers)
+
+---
+
+## 10. gated pipeline (the real thing)
+- deploy = just ANOTHER job in the SAME yml, next to the test job
+- the magic keyword = **`needs: test`** → deploy wont even start until test is green
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pytest
+      - run: pytest
+
+  deploy:
+    needs: test                  # THE GATE. no green = no deploy
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -X POST "$RENDER_DEPLOY_HOOK"
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+```
+
+- by default jobs run in PARALLEL → `needs:` is what chains them
+- turn OFF render's own auto-deploy so MY pipeline is the only thing that triggers it (else back to ungated)
+
+---
+
+## 11. secrets
+- prod needs api keys / db passwords / deploy hook url.. these NEVER go in the code
+- store in repo: **Settings → Secrets and variables → Actions**
+- pull in with `${{ secrets.NAME }}` at runtime
+- yml stays public + safe, secret stays hidden
+- hardcoding a key in a repo = resume killer
+
+---
+
+## 12. the handshake (how the 2 platforms talk) — my own words
+- **github = the brain**: runs tests → decides → if green, makes the API call
+- **render = dumb but secure trigger**: just sits there, exposes a secret hook URL, fires when the right URL knocks. has NO idea if tests passed or who's calling
+- for render the secret IS the url (token baked in) → thats why it lives in github secrets, the url = the password
+- same shape as agentic AI btw: brain decides, tool executes. decision on one side, execution on the other
+
+---
+
+## 13. what a PROFESSIONAL pipeline adds (talk about these in interviews)
+1. deploy GATED by CI (`needs: test`) — most important
+2. multiple environments — staging (prod-like clone) first, verify, THEN prod
+3. approval gate — human "yes ship it" before prod (the delivery thing)
+4. secrets management — injected at deploy, never in code
+5. build once deploy many — build a docker image once, tag it, deploy SAME artifact to staging then prod
+6. safety nets — health checks, smoke tests, ROLLBACK plan, monitoring/alerts
+
+threshold for honestly putting CI/CD on resume = #1 (gated deploy) + a real deploy. rest = grow into on the job
+
+---
+
+## the full arc (so I remember the order)
+branches → PRs → branch protection → CI robot → reading failures → gated CD → deploy handshake → secrets
+
+resume-ready line (honest version):
+*"Continuous Integration + gated Deployment with GitHub Actions — automated pytest on every PR, branch protection enforcing green checks before merge, deploy job gated on passing tests."*
+
+the import-path debugging story (ModuleNotFoundError in CI, diagnosed from pytest output) = great interview answer, most juniors cant tell it. KEEP IT.
